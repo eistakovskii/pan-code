@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-__credits__ = ['David Dale', 'Daniil Moskovskiy', 'Dmitry Ustalov']
+__credits__ = ['David Dale', 'Daniil Moskovskiy', 'Dmitry Ustalov', 'Elisei Stakovskii']
 
 import argparse
 import sys
@@ -13,8 +13,7 @@ import pandas as pd
 import torch
 from sacrebleu import CHRF
 from tqdm.auto import trange
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoModelForMaskedLM
 
 def prepare_target_label(model: AutoModelForSequenceClassification, target_label: Union[int, str]) -> int:
     if target_label in model.config.id2label:
@@ -130,25 +129,56 @@ def evaluate_meaning(
             raise ValueError('aggregation should be one of "mean", "prod", "f1"')
     return scores
 
+def get_pppl_score(model, tokenizer, sentence, device):
+    """
+    Pseudoperplexity function as realized by David Dale
+    The source link : https://gist.github.com/avidale/f574c014cd686709636b89208f2259ce
+    """
+    tensor_input = tokenizer.encode(sentence, return_tensors='pt').to(device)
+    repeat_input = tensor_input.repeat(tensor_input.size(-1)-2, 1).to(device)
+    mask = torch.ones(tensor_input.size(-1) - 1).diag(1)[:-2].to(device)
+    masked_input = repeat_input.masked_fill(mask == 1, tokenizer.mask_token_id).to(device)
+    labels = repeat_input.masked_fill( masked_input != tokenizer.mask_token_id, -100).to(device)
+    with torch.inference_mode():
+        loss = model(masked_input, labels=labels).loss
+    return np.exp(loss.item())
 
-def evaluate_cola(
-        model: AutoModelForSequenceClassification,
-        tokenizer: AutoTokenizer,
-        texts: List[str],
-        target_label: int = 1,
-        batch_size: int = 32
-) -> npt.NDArray[np.float64]:
-    target_label = prepare_target_label(model, target_label)
-    scores = classify_texts(
-        model,
-        tokenizer,
-        texts,
-        target_label,
-        batch_size=batch_size,
-        desc='Fluency'
-    )
-    return scores
+def evaluate_cola(input_sentences: List[str], output_sentences: List[str], model: AutoModelForMaskedLM, tokenizer: AutoTokenizer, device_used: bool) -> np.ndarray:
+    """
+    This function using pseudoperplexity performs a relative fluency estimation and outputs a list of bool values.
+    As inputs the function expects two lists of sentences. In essence, the function compares whether the pseudoperplexity score
+    of the sentence in the second list is less or equal to the score of the sentence in the first list. If it does, then the ouput is 1, i.e. fluency
+    did not become worse, otherwise the score is 0 - the sentence is not fluent, i.e. the transformation to the initial sentence made the sentence
+    ungrammatical 
+    """
+    if device_used:
+        device = 'cpu'
+    else:
+        device = 'cuda'
 
+    first_pppl_vector = list() # temporary perplexity scores list
+    second_pppl_vector = list() # temporary perplexity scores list
+    final_bools_vector = list() # here we put the final bool values of whether the output sentence is fluent or not
+
+    assert len(input_sentences) == len(output_sentences), 'Input and output sentences number mismatch!' # The len of two lists must match!
+
+    for sent in input_sentences:
+        curr_pppl_score = get_pppl_score(sentence=sent, model=model, tokenizer=tokenizer, device=device) 
+        first_pppl_vector.append(curr_pppl_score)
+
+    for sent in output_sentences:
+        curr_pppl_score = get_pppl_score(sentence=sent, model=model, tokenizer=tokenizer, device=device) 
+        second_pppl_vector.append(curr_pppl_score)
+
+    for i in range(len(first_pppl_vector)):
+        if second_pppl_vector[i] <= first_pppl_vector[i]:
+            final_bools_vector.append(1)
+        else:
+            final_bools_vector.append(0)
+    
+    assert len(first_pppl_vector) == len(second_pppl_vector) == len(final_bools_vector)
+
+    return np.array(final_bools_vector)
 
 def evaluate_style_transfer(
         original_texts: List[str],
@@ -157,12 +187,12 @@ def evaluate_style_transfer(
         style_tokenizer: AutoTokenizer,
         meaning_model: AutoModelForSequenceClassification,
         meaning_tokenizer: AutoTokenizer,
-        fluency_model: AutoModelForSequenceClassification,
+        fluency_model: AutoModelForMaskedLM,
         fluency_tokenizer: AutoTokenizer,
         references: Optional[List[str]] = None,
         style_target_label: int = 1,
         meaning_target_label: str = "paraphrase",
-        cola_target_label: int = 1,
+        device_used: bool = False,
         batch_size: int = 32
 ) -> Dict[str, npt.NDArray[np.float64]]:
     accuracy = evaluate_style(
@@ -184,11 +214,11 @@ def evaluate_style_transfer(
     )
 
     fluency = evaluate_cola(
-        fluency_model,
-        fluency_tokenizer,
-        texts=rewritten_texts,
-        batch_size=batch_size,
-        target_label=cola_target_label,
+        model=fluency_model,
+        tokenizer=fluency_tokenizer,
+        input_sentences=original_texts
+        output_sentences=rewritten_texts,
+        device_used=device_used,
     )
 
     joint = accuracy * similarity * fluency
@@ -288,8 +318,6 @@ def main() -> None:
                         help='Style evaluation model on Hugging Face Hub')
     parser.add_argument('--meaning-model', type=str, required=True,
                         help='Meaning evaluation model on Hugging Face Hub')
-    parser.add_argument('--fluency-model', type=str, required=True,
-                        help='Fluency evaluation model on Hugging Face Hub')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='Disable the use of CUDA')
     parser.add_argument('prediction', type=argparse.FileType('rb'),
@@ -299,7 +327,7 @@ def main() -> None:
 
     style_model, style_tokenizer = load_model(args.style_model, use_cuda=not args.no_cuda)
     meaning_model, meaning_tokenizer = load_model(args.meaning_model, use_cuda=not args.no_cuda)
-    fluency_model, fluency_tokenizer = load_model(args.fluency_model, use_cuda=not args.no_cuda)
+    fluency_model, fluency_tokenizer = load_model(model_name='cis-lmu/glot500-base', use_cuda=not args.no_cuda, model_class=AutoModelForMaskedLM)
 
     run_evaluation(args, evaluator=partial(
         evaluate_style_transfer,
@@ -311,7 +339,7 @@ def main() -> None:
         fluency_tokenizer=fluency_tokenizer,
         style_target_label=0,
         meaning_target_label=0,
-        cola_target_label=0
+        device_used=args.no_cuda
     ))
 
 
